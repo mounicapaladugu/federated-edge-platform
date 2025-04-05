@@ -1,8 +1,11 @@
 import os
 import uvicorn
 import logging
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+import pandas as pd
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, Response
 import torch
 import json
 import requests
@@ -10,6 +13,7 @@ from typing import Dict, List, Optional, Any, Tuple
 import time
 from model_aggregator import ModelAggregator
 from fl_server import FlowerServer
+from common.fl.monitoring import FederatedMonitor
 
 # Configure logging
 logging.basicConfig(
@@ -38,6 +42,9 @@ model_aggregator = ModelAggregator()
 
 # Initialize Flower server
 flower_server = FlowerServer(node_count=NODE_COUNT)
+
+# Initialize monitoring system
+monitor = FederatedMonitor(base_dir="monitoring")
 
 # Store registered nodes
 registered_nodes = {}
@@ -170,6 +177,12 @@ async def rollback_model(version: int):
     """Roll back to a specific model version"""
     success = flower_server.rollback_model(version)
     if success:
+        # Log the rollback in monitoring system
+        monitor.log_deployment(
+            model_version=version,
+            round_num=flower_server.current_round,
+            metadata={"action": "rollback", "reason": "manual_rollback"}
+        )
         return {"status": "success", "message": f"Rolled back to version {version}"}
     else:
         raise HTTPException(status_code=404, detail=f"Model version {version} not found or rollback failed")
@@ -251,6 +264,13 @@ async def receive_update(
             "timestamp": time.time()
         }
         
+        # Log node metrics in monitoring system
+        monitor.log_node_metrics(
+            node_id=node_id,
+            round_num=current_round,
+            metrics=metrics_dict
+        )
+        
         logger.info(f"Received update from node {node_id} for round {current_round}")
         
         # Check if all nodes have reported
@@ -282,8 +302,9 @@ async def aggregate_models():
         torch.save(aggregated_model.state_dict(), "models/global_model.pt")
         
         # Update metadata
+        version = current_round  # Use round number as version
         metadata = {
-            "version": f"round_{current_round}",
+            "version": version,
             "timestamp": time.time(),
             "round": current_round,
             "participating_nodes": list(node_updates.keys())
@@ -291,6 +312,55 @@ async def aggregate_models():
         
         with open("models/global_metadata.json", "w") as f:
             json.dump(metadata, f)
+        
+        # Save versioned copy
+        os.makedirs("models/versions", exist_ok=True)
+        torch.save(aggregated_model.state_dict(), f"models/versions/global_model_v{version}.pt")
+        
+        with open(f"models/versions/global_metadata_v{version}.json", "w") as f:
+            json.dump(metadata, f)
+        
+        # Evaluate aggregated model (mock metrics for now)
+        metrics = model_aggregator.evaluate_aggregated_model(aggregated_model)
+        
+        # Log metrics in monitoring system
+        monitor.log_aggregated_metrics(
+            round_num=current_round,
+            metrics=metrics,
+            model_metadata=metadata
+        )
+        
+        # Log deployment
+        monitor.log_deployment(
+            model_version=version,
+            round_num=current_round,
+            metadata={"action": "deployment", "metrics": metrics}
+        )
+        
+        # Check if we should automatically rollback based on performance
+        if current_round > 1:
+            # Get previous round metrics
+            prev_round_metrics = monitor.get_round_metrics(current_round - 1)
+            if prev_round_metrics and "aggregated" in prev_round_metrics:
+                prev_metrics = prev_round_metrics["aggregated"]["metrics"]
+                
+                # Check if we should rollback
+                should_rollback, reason = monitor.should_rollback(metrics, prev_metrics)
+                if should_rollback:
+                    # Get previous version
+                    prev_version = current_round - 1
+                    
+                    # Rollback to previous version
+                    success = flower_server.rollback_model(prev_version)
+                    if success:
+                        logger.warning(f"Automatic rollback to version {prev_version}: {reason}")
+                        
+                        # Log the automatic rollback
+                        monitor.log_deployment(
+                            model_version=prev_version,
+                            round_num=current_round,
+                            metadata={"action": "auto_rollback", "reason": reason}
+                        )
         
         # Reset for next round
         federated_round_active = False
@@ -314,6 +384,228 @@ async def get_round_status():
         "total_nodes": len(registered_nodes),
         "node_statuses": {node_id: info["status"] for node_id, info in registered_nodes.items()}
     }
+
+# Monitoring and model management endpoints
+
+@app.get("/monitoring/metrics")
+async def get_metrics(node_id: Optional[str] = None, round_num: Optional[int] = None):
+    """Get monitoring metrics, optionally filtered by node or round"""
+    if node_id:
+        return monitor.get_node_metrics_history(node_id)
+    elif round_num:
+        return monitor.get_round_metrics(round_num)
+    else:
+        return monitor.get_all_metrics()
+
+@app.get("/monitoring/deployment_logs")
+async def get_deployment_logs():
+    """Get all model deployment logs"""
+    return monitor.get_deployment_logs()
+
+@app.get("/monitoring/plots/{metric_name}")
+async def get_metric_plot(
+    metric_name: str = Path(..., description="Metric name to plot (e.g., accuracy, loss)"),
+    node_id: Optional[str] = Query(None, description="Optional node ID to filter by")
+):
+    """Get a plot of metrics over rounds"""
+    img_str = monitor.generate_metrics_plot(metric_name, node_id)
+    if not img_str:
+        raise HTTPException(status_code=404, detail=f"No {metric_name} data found")
+    
+    return Response(content=f'<img src="data:image/png;base64,{img_str}" />', media_type="text/html")
+
+@app.get("/models/versions")
+async def get_model_versions():
+    """Get all available model versions"""
+    versions_dir = "models/versions"
+    if not os.path.exists(versions_dir):
+        return []
+    
+    versions = []
+    for filename in os.listdir(versions_dir):
+        if filename.startswith("global_metadata_v") and filename.endswith(".json"):
+            try:
+                with open(os.path.join(versions_dir, filename), "r") as f:
+                    metadata = json.load(f)
+                    versions.append(metadata)
+            except Exception as e:
+                logger.error(f"Error loading model metadata {filename}: {str(e)}")
+    
+    # Sort by version number (descending)
+    versions.sort(key=lambda x: x.get("version", 0), reverse=True)
+    
+    return versions
+
+@app.post("/monitoring/thresholds")
+async def update_validation_thresholds(thresholds: Dict[str, float]):
+    """Update validation thresholds for automatic rollback"""
+    monitor.update_validation_thresholds(thresholds)
+    return {"status": "success", "thresholds": monitor.validation_thresholds}
+
+@app.post("/data_drift/calculate")
+async def calculate_data_drift(
+    node_id: str = Form(...),
+    reference_data: UploadFile = File(...),
+    current_data: UploadFile = File(...)
+):
+    """Calculate data drift between reference and current data"""
+    try:
+        # Read CSV files
+        reference_df = pd.read_csv(reference_data.file)
+        current_df = pd.read_csv(current_data.file)
+        
+        # Calculate drift
+        drift_scores = monitor.calculate_data_drift(node_id, reference_df, current_df)
+        
+        return {"node_id": node_id, "drift_scores": drift_scores}
+    
+    except Exception as e:
+        logger.error(f"Error calculating data drift: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error calculating data drift: {str(e)}")
+
+@app.get("/monitoring/dashboard")
+async def get_monitoring_dashboard():
+    """Get a simple HTML dashboard for monitoring"""
+    # Get metrics and model versions
+    metrics = monitor.get_all_metrics()
+    deployment_logs = monitor.get_deployment_logs()
+    
+    # Create a simple HTML dashboard
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Federated Learning Monitoring Dashboard</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            h1, h2 {{ color: #333; }}
+            .container {{ display: flex; flex-wrap: wrap; }}
+            .card {{ background: #f9f9f9; border-radius: 5px; padding: 15px; margin: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+            .metrics {{ width: 45%; }}
+            .models {{ width: 45%; }}
+            table {{ border-collapse: collapse; width: 100%; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #f2f2f2; }}
+            tr:nth-child(even) {{ background-color: #f9f9f9; }}
+            .plot {{ margin: 20px 0; }}
+            .button {{ background-color: #4CAF50; border: none; color: white; padding: 10px 15px; 
+                      text-align: center; text-decoration: none; display: inline-block; 
+                      font-size: 14px; margin: 4px 2px; cursor: pointer; border-radius: 4px; }}
+            .button.rollback {{ background-color: #f44336; }}
+        </style>
+    </head>
+    <body>
+        <h1>Federated Learning Monitoring Dashboard</h1>
+        
+        <div class="container">
+            <div class="card metrics">
+                <h2>Current Round Status</h2>
+                <p>Round: {current_round}</p>
+                <p>Active: {federated_round_active}</p>
+                <p>Nodes Reported: {len(node_updates)} / {len(registered_nodes)}</p>
+            </div>
+            
+            <div class="card metrics">
+                <h2>Metrics Visualization</h2>
+                <div class="plot">
+                    <img src="/monitoring/plots/accuracy" alt="Accuracy Plot" width="100%">
+                </div>
+                <div class="plot">
+                    <img src="/monitoring/plots/loss" alt="Loss Plot" width="100%">
+                </div>
+            </div>
+        </div>
+        
+        <div class="card models">
+            <h2>Model Versions</h2>
+            <table>
+                <tr>
+                    <th>Version</th>
+                    <th>Round</th>
+                    <th>Timestamp</th>
+                    <th>Actions</th>
+                </tr>
+    """
+    
+    # Add model versions to the table
+    versions_dir = "models/versions"
+    if os.path.exists(versions_dir):
+        versions = []
+        for filename in os.listdir(versions_dir):
+            if filename.startswith("global_metadata_v") and filename.endswith(".json"):
+                try:
+                    with open(os.path.join(versions_dir, filename), "r") as f:
+                        metadata = json.load(f)
+                        versions.append(metadata)
+                except Exception as e:
+                    logger.error(f"Error loading model metadata {filename}: {str(e)}")
+        
+        # Sort by version number (descending)
+        versions.sort(key=lambda x: x.get("version", 0), reverse=True)
+        
+        for version in versions:
+            version_num = version.get("version", "Unknown")
+            round_num = version.get("round", "Unknown")
+            timestamp = version.get("timestamp", "Unknown")
+            
+            # Format timestamp
+            if isinstance(timestamp, (int, float)):
+                from datetime import datetime
+                timestamp = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+            
+            html_content += f"""
+                <tr>
+                    <td>{version_num}</td>
+                    <td>{round_num}</td>
+                    <td>{timestamp}</td>
+                    <td>
+                        <a href="/fl/rollback/{version_num}" class="button rollback" 
+                           onclick="return confirm('Are you sure you want to rollback to version {version_num}?')">
+                           Rollback
+                        </a>
+                    </td>
+                </tr>
+            """
+    
+    html_content += """
+            </table>
+        </div>
+        
+        <div class="card">
+            <h2>Deployment Logs</h2>
+            <table>
+                <tr>
+                    <th>Version</th>
+                    <th>Round</th>
+                    <th>Timestamp</th>
+                    <th>Action</th>
+                </tr>
+    """
+    
+    # Add deployment logs to the table
+    for log in deployment_logs:
+        version = log.get("model_version", "Unknown")
+        round_num = log.get("round", "Unknown")
+        timestamp = log.get("timestamp", "Unknown")
+        action = log.get("metadata", {}).get("action", "deployment")
+        
+        html_content += f"""
+            <tr>
+                <td>{version}</td>
+                <td>{round_num}</td>
+                <td>{timestamp}</td>
+                <td>{action}</td>
+            </tr>
+        """
+    
+    html_content += """
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html_content)
 
 if __name__ == "__main__":
     # Create necessary directories
