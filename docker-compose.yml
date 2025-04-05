@@ -1,0 +1,70 @@
+version: '3'
+
+services:
+  aggregator:
+    build:
+      context: ./backend/aggregator
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/aggregator:/app
+      - ./backend/common:/app/common
+    environment:
+      - NODE_COUNT=3
+    networks:
+      - federated-network
+
+  edge-node-1:
+    build:
+      context: ./backend/edge_node
+    volumes:
+      - ./backend/edge_node:/app
+      - ./backend/common:/app/common
+      - ./backend/edge_node/data/node1:/app/data
+    environment:
+      - NODE_ID=1
+      - AGGREGATOR_URL=http://aggregator:8000
+    depends_on:
+      - aggregator
+    networks:
+      - federated-network
+    ports:
+      - "8001:8001"
+
+  edge-node-2:
+    build:
+      context: ./backend/edge_node
+    volumes:
+      - ./backend/edge_node:/app
+      - ./backend/common:/app/common
+      - ./backend/edge_node/data/node2:/app/data
+    environment:
+      - NODE_ID=2
+      - AGGREGATOR_URL=http://aggregator:8000
+    depends_on:
+      - aggregator
+    networks:
+      - federated-network
+    ports:
+      - "8002:8001"
+
+  edge-node-3:
+    build:
+      context: ./backend/edge_node
+    volumes:
+      - ./backend/edge_node:/app
+      - ./backend/common:/app/common
+      - ./backend/edge_node/data/node3:/app/data
+    environment:
+      - NODE_ID=3
+      - AGGREGATOR_URL=http://aggregator:8000
+    depends_on:
+      - aggregator
+    networks:
+      - federated-network
+    ports:
+      - "8003:8001"
+
+networks:
+  federated-network:
+    driver: bridge
