@@ -1,13 +1,14 @@
 import os
 import uvicorn
 import logging
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import torch
 import json
 import requests
 from api.routes import router as api_router
 from training.trainer import ModelTrainer
+from fl_client import EdgeNodeFlowerClient
 import time
 import threading
 
@@ -39,6 +40,9 @@ AGGREGATOR_URL = os.getenv("AGGREGATOR_URL", "http://localhost:8000")
 
 # Initialize model trainer
 model_trainer = ModelTrainer(node_id=NODE_ID)
+
+# Initialize Flower client
+fl_client = EdgeNodeFlowerClient(node_id=NODE_ID, aggregator_url=AGGREGATOR_URL)
 
 # Health monitoring variables
 health_metrics = {
@@ -92,6 +96,43 @@ async def root():
 async def get_health():
     """Get the health status of the edge node"""
     return health_metrics
+
+@app.post("/fl/start")
+async def start_flower_client(background_tasks: BackgroundTasks, server_address: str = "aggregator:8080"):
+    """Start Flower client and connect to the server"""
+    try:
+        # Start Flower client in background
+        background_tasks.add_task(start_fl_client, server_address)
+        return {"status": "started", "server_address": server_address}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error starting Flower client: {str(e)}")
+
+def start_fl_client(server_address: str):
+    """Start Flower client in background"""
+    try:
+        # Load model if available
+        model_path = f"models/model_node_{NODE_ID}.pt"
+        if os.path.exists(model_path):
+            fl_client.load_model(model_path)
+        
+        # Start client
+        fl_client.start_client(server_address)
+    except Exception as e:
+        logger.error(f"Error in Flower client: {str(e)}")
+
+@app.get("/fl/status")
+async def get_fl_status():
+    """Get Flower client status"""
+    return fl_client.get_client_status()
+
+@app.post("/fl/privacy")
+async def update_privacy_settings(settings: dict):
+    """Update privacy settings for federated learning"""
+    try:
+        fl_client.update_privacy_settings(settings)
+        return {"status": "success", "settings": fl_client.privacy_setting}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating privacy settings: {str(e)}")
 
 if __name__ == "__main__":
     # Run the FastAPI application

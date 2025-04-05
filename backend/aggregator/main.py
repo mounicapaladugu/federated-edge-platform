@@ -1,14 +1,15 @@
 import os
 import uvicorn
 import logging
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import torch
 import json
 import requests
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Tuple
 import time
 from model_aggregator import ModelAggregator
+from fl_server import FlowerServer
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +35,9 @@ NODE_COUNT = int(os.getenv("NODE_COUNT", "3"))
 
 # Initialize model aggregator
 model_aggregator = ModelAggregator()
+
+# Initialize Flower server
+flower_server = FlowerServer(node_count=NODE_COUNT)
 
 # Store registered nodes
 registered_nodes = {}
@@ -76,8 +80,8 @@ async def get_nodes():
     return registered_nodes
 
 @app.post("/start_federated_round")
-async def start_federated_round():
-    """Start a new federated learning round"""
+async def start_federated_round(background_tasks: BackgroundTasks, config: Optional[Dict[str, Any]] = None):
+    """Start a new federated learning round using Flower"""
     global current_round, federated_round_active, node_updates
     
     if federated_round_active:
@@ -93,21 +97,28 @@ async def start_federated_round():
     
     logger.info(f"Starting federated round {current_round}")
     
-    # Get or initialize global model
+    # Update Flower server configuration if provided
+    if config:
+        flower_server.update_config(config)
+    
+    # Start Flower server in background
+    background_tasks.add_task(start_flower_server)
+    
+    # For backward compatibility, also distribute model using the old method
     model_path = "models/global_model.pt"
     os.makedirs("models", exist_ok=True)
     
     if not os.path.exists(model_path):
         # Initialize a new model if none exists
         logger.info("Initializing new global model")
-        model = model_aggregator.initialize_model()
-        torch.save(model.state_dict(), model_path)
+        flower_server.initialize_model()
     
     # Create metadata
     metadata = {
         "version": f"round_{current_round}",
         "timestamp": time.time(),
-        "round": current_round
+        "round": current_round,
+        "fl_server_address": "aggregator:8080"  # Flower server address
     }
     
     # Save metadata
@@ -120,8 +131,48 @@ async def start_federated_round():
     return {
         "round": current_round,
         "status": "started",
-        "nodes": distribution_results
+        "nodes": distribution_results,
+        "fl_server": flower_server.get_server_status()
     }
+
+def start_flower_server():
+    """Start the Flower server for federated learning"""
+    try:
+        # Configure the server
+        config = {
+            "min_fit_clients": max(2, len(registered_nodes) - 1),
+            "min_evaluate_clients": max(2, len(registered_nodes) - 1),
+            "min_available_clients": len(registered_nodes)
+        }
+        
+        # Start the server
+        flower_server.start_server(config)
+        
+    except Exception as e:
+        logger.error(f"Error starting Flower server: {str(e)}")
+        
+@app.post("/fl/config")
+async def update_fl_config(config: Dict[str, Any]):
+    """Update the federated learning configuration"""
+    try:
+        flower_server.update_config(config)
+        return {"status": "success", "config": flower_server.config}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating config: {str(e)}")
+
+@app.get("/fl/status")
+async def get_fl_status():
+    """Get the status of the Flower federated learning server"""
+    return flower_server.get_server_status()
+
+@app.post("/fl/rollback/{version}")
+async def rollback_model(version: int):
+    """Roll back to a specific model version"""
+    success = flower_server.rollback_model(version)
+    if success:
+        return {"status": "success", "message": f"Rolled back to version {version}"}
+    else:
+        raise HTTPException(status_code=404, detail=f"Model version {version} not found or rollback failed")
 
 async def distribute_model_to_nodes(model_path: str, metadata: Dict):
     """Distribute the global model to all registered nodes"""
@@ -268,6 +319,7 @@ if __name__ == "__main__":
     # Create necessary directories
     os.makedirs("models", exist_ok=True)
     os.makedirs("updates", exist_ok=True)
+    os.makedirs("models/versions", exist_ok=True)
     
     # Run the FastAPI application
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
