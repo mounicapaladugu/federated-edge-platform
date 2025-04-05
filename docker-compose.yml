@@ -9,8 +9,12 @@ services:
     volumes:
       - ./backend/aggregator:/app
       - ./backend/common:/app/common
+      - ./secure_transfer:/mnt/secure_transfer
     environment:
       - NODE_COUNT=3
+      - SECURE_MOUNT_DIR=/mnt/secure_transfer
+      - AIR_GAPPED_MODE=${AIR_GAPPED_MODE:-false}
+      - SECURE_CHECK_INTERVAL=60
     networks:
       - federated-network
 
@@ -21,9 +25,13 @@ services:
       - ./backend/edge_node:/app
       - ./backend/common:/app/common
       - ./backend/edge_node/data/node1:/app/data
+      - ./secure_transfer:/mnt/secure_transfer
     environment:
       - NODE_ID=1
       - AGGREGATOR_URL=http://aggregator:8000
+      - SECURE_MOUNT_DIR=/mnt/secure_transfer
+      - AIR_GAPPED_MODE=${AIR_GAPPED_MODE:-false}
+      - SECURE_CHECK_INTERVAL=60
     depends_on:
       - aggregator
     networks:
@@ -38,9 +46,13 @@ services:
       - ./backend/edge_node:/app
       - ./backend/common:/app/common
       - ./backend/edge_node/data/node2:/app/data
+      - ./secure_transfer:/mnt/secure_transfer
     environment:
       - NODE_ID=2
       - AGGREGATOR_URL=http://aggregator:8000
+      - SECURE_MOUNT_DIR=/mnt/secure_transfer
+      - AIR_GAPPED_MODE=${AIR_GAPPED_MODE:-false}
+      - SECURE_CHECK_INTERVAL=60
     depends_on:
       - aggregator
     networks:
@@ -55,9 +67,13 @@ services:
       - ./backend/edge_node:/app
       - ./backend/common:/app/common
       - ./backend/edge_node/data/node3:/app/data
+      - ./secure_transfer:/mnt/secure_transfer
     environment:
       - NODE_ID=3
       - AGGREGATOR_URL=http://aggregator:8000
+      - SECURE_MOUNT_DIR=/mnt/secure_transfer
+      - AIR_GAPPED_MODE=${AIR_GAPPED_MODE:-false}
+      - SECURE_CHECK_INTERVAL=60
     depends_on:
       - aggregator
     networks:
@@ -68,3 +84,6 @@ services:
 networks:
   federated-network:
     driver: bridge
+
+volumes:
+  secure_transfer:

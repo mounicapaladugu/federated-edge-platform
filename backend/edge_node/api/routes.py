@@ -11,6 +11,7 @@ import time
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from common.fl.secure_transfer import SecureModelTransfer
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,6 +28,11 @@ router = APIRouter(prefix="/api", tags=["edge_node"])
 # Get environment variables
 NODE_ID = os.getenv("NODE_ID", "1")
 AGGREGATOR_URL = os.getenv("AGGREGATOR_URL", "http://localhost:8000")
+SECURE_MOUNT_DIR = os.getenv("SECURE_MOUNT_DIR", "/mnt/secure_transfer")
+AIR_GAPPED_MODE = os.getenv("AIR_GAPPED_MODE", "false").lower() == "true"
+
+# Initialize secure transfer if needed
+secure_transfer = SecureModelTransfer(node_id=NODE_ID, is_aggregator=False, mount_dir=SECURE_MOUNT_DIR)
 
 # Initialize model trainer
 model_trainer = ModelTrainer(node_id=NODE_ID)
@@ -65,7 +71,7 @@ async def get_status():
 @router.post("/receive_model")
 async def receive_model(background_tasks: BackgroundTasks, model_file: UploadFile = File(...), metadata: UploadFile = File(None)):
     """
-    Receive a model from the central hub/aggregator
+    Receive a model from the central hub/aggregator via HTTP
     """
     try:
         # Create models directory if it doesn't exist
@@ -96,6 +102,32 @@ async def receive_model(background_tasks: BackgroundTasks, model_file: UploadFil
     except Exception as e:
         logger.error(f"Error receiving model: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error receiving model: {str(e)}")
+
+@router.post("/secure/import_model")
+async def secure_import_model(background_tasks: BackgroundTasks):
+    """
+    Import a model from the secure mount directory in air-gapped mode
+    """
+    try:
+        if not AIR_GAPPED_MODE:
+            raise HTTPException(status_code=400, detail="This endpoint is only available in air-gapped mode")
+        
+        # Import the model from the secure mount directory
+        metadata = secure_transfer.import_global_model()
+        
+        if metadata:
+            logger.info(f"Imported model version: {metadata.get('version', 'unknown')}")
+            
+            # Schedule training in the background
+            background_tasks.add_task(train_model_task)
+            
+            return {"message": "Model imported successfully, training scheduled", "metadata": metadata}
+        else:
+            raise HTTPException(status_code=404, detail="No model found in secure mount directory")
+    
+    except Exception as e:
+        logger.error(f"Error importing model: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error importing model: {str(e)}")
 
 @router.get("/training_status")
 async def get_training_status():
@@ -230,23 +262,33 @@ def send_model_updates():
             logger.error("Model file not found")
             return
         
-        # Prepare files for upload
-        files = {
-            'model_file': ('model.pt', open(model_path, 'rb'), 'application/octet-stream'),
-            'metrics': ('metrics.json', json.dumps(training_metrics), 'application/json')
-        }
-        
-        # Send to aggregator
-        response = requests.post(
-            f"{AGGREGATOR_URL}/receive_update",
-            files=files,
-            data={"node_id": NODE_ID}
-        )
-        
-        if response.status_code == 200:
-            logger.info("Model updates sent successfully to aggregator")
+        if AIR_GAPPED_MODE:
+            # In air-gapped mode, export the model update to the secure mount directory
+            logger.info("Air-gapped mode: exporting model update to secure mount directory")
+            success = secure_transfer.export_model_update(model_path, training_metrics)
+            if success:
+                logger.info("Model updates exported successfully to secure mount directory")
+            else:
+                logger.error("Failed to export model updates to secure mount directory")
         else:
-            logger.error(f"Failed to send model updates: {response.text}")
+            # In normal mode, send the model update to the aggregator via HTTP
+            # Prepare files for upload
+            files = {
+                'model_file': ('model.pt', open(model_path, 'rb'), 'application/octet-stream'),
+                'metrics': ('metrics.json', json.dumps(training_metrics), 'application/json')
+            }
+            
+            # Send to aggregator
+            response = requests.post(
+                f"{AGGREGATOR_URL}/receive_update",
+                files=files,
+                data={"node_id": NODE_ID}
+            )
+            
+            if response.status_code == 200:
+                logger.info("Model updates sent successfully to aggregator")
+            else:
+                logger.error(f"Failed to send model updates: {response.text}")
     
     except Exception as e:
         logger.error(f"Error sending model updates: {str(e)}")

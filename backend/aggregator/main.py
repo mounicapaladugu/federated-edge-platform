@@ -3,6 +3,7 @@ import uvicorn
 import logging
 import pandas as pd
 import numpy as np
+import shutil
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
@@ -11,9 +12,11 @@ import json
 import requests
 from typing import Dict, List, Optional, Any, Tuple
 import time
+import threading
 from model_aggregator import ModelAggregator
 from fl_server import FlowerServer
 from common.fl.monitoring import FederatedMonitor
+from common.fl.secure_transfer import SecureModelTransfer
 
 # Configure logging
 logging.basicConfig(
@@ -45,6 +48,11 @@ flower_server = FlowerServer(node_count=NODE_COUNT)
 
 # Initialize monitoring system
 monitor = FederatedMonitor(base_dir="monitoring")
+
+# Initialize secure transfer
+SECURE_MOUNT_DIR = os.getenv("SECURE_MOUNT_DIR", "/mnt/secure_transfer")
+AIR_GAPPED_MODE = os.getenv("AIR_GAPPED_MODE", "false").lower() == "true"
+secure_transfer = SecureModelTransfer(is_aggregator=True, mount_dir=SECURE_MOUNT_DIR)
 
 # Store registered nodes
 registered_nodes = {}
@@ -191,6 +199,19 @@ async def distribute_model_to_nodes(model_path: str, metadata: Dict):
     """Distribute the global model to all registered nodes"""
     results = {}
     
+    # If in air-gapped mode, export the model to the secure mount directory
+    if AIR_GAPPED_MODE:
+        logger.info("Air-gapped mode: exporting global model to secure mount directory")
+        success = secure_transfer.export_global_model(model_path, metadata)
+        if success:
+            logger.info("Global model exported successfully to secure mount directory")
+            results["secure_export"] = "success"
+        else:
+            logger.error("Failed to export global model to secure mount directory")
+            results["secure_export"] = "error: failed to export model"
+        return results
+    
+    # In normal mode, distribute the model to each node via HTTP
     for node_id, node_info in registered_nodes.items():
         try:
             # Prepare files for upload
@@ -607,11 +628,128 @@ async def get_monitoring_dashboard():
     
     return HTMLResponse(content=html_content)
 
+@app.post("/secure/check_updates")
+async def check_secure_updates(background_tasks: BackgroundTasks):
+    """Check for model updates in the secure mount directory"""
+    if not AIR_GAPPED_MODE:
+        raise HTTPException(status_code=400, detail="This endpoint is only available in air-gapped mode")
+    
+    background_tasks.add_task(import_secure_updates)
+    return {"status": "checking", "message": "Checking for model updates in secure mount directory"}
+
+def import_secure_updates():
+    """Import model updates from the secure mount directory"""
+    try:
+        logger.info("Checking for model updates in secure mount directory...")
+        updates = secure_transfer.import_model_updates()
+        
+        if updates:
+            logger.info(f"Found {len(updates)} model updates in secure mount directory")
+            
+            # Process each update
+            for update in updates:
+                node_id = update["node_id"]
+                model_path = update["model_path"]
+                metadata = update["metadata"]
+                
+                logger.info(f"Processing update from node {node_id}")
+                
+                # Save update to the updates directory
+                os.makedirs(f"updates/node_{node_id}", exist_ok=True)
+                update_path = f"updates/node_{node_id}/update_{int(time.time())}.pt"
+                shutil.copy(model_path, update_path)
+                
+                # Update node status if registered
+                if node_id in registered_nodes:
+                    registered_nodes[node_id]["status"] = "update_received"
+                    registered_nodes[node_id]["last_seen"] = time.time()
+                
+                # Save metrics
+                metrics = metadata.get("metrics", {})
+                if metrics:
+                    # Log metrics to monitoring system
+                    monitor.log_metrics(
+                        node_id=node_id,
+                        round_num=current_round,
+                        metrics=metrics
+                    )
+                    
+                    # Store update for aggregation
+                    node_updates[node_id] = {
+                        "model_path": update_path,
+                        "metrics": metrics,
+                        "timestamp": time.time()
+                    }
+            
+            return True
+        else:
+            logger.info("No model updates found")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error importing model updates: {str(e)}")
+        return False
+
+def check_secure_updates_periodically():
+    """Background thread to periodically check for model updates in air-gapped mode"""
+    while True:
+        try:
+            if AIR_GAPPED_MODE:
+                logger.info("Checking for model updates in secure mount directory...")
+                import_secure_updates()
+        except Exception as e:
+            logger.error(f"Error in secure update check thread: {str(e)}")
+            
+        # Wait before checking again (e.g., every 5 minutes)
+        check_interval = int(os.getenv("SECURE_CHECK_INTERVAL", "300"))
+        time.sleep(check_interval)
+
+@app.post("/secure/export_model")
+async def manual_export_model():
+    """Manually export the global model to the secure mount directory"""
+    if not AIR_GAPPED_MODE:
+        raise HTTPException(status_code=400, detail="This endpoint is only available in air-gapped mode")
+    
+    try:
+        model_path = "models/global_model.pt"
+        if not os.path.exists(model_path):
+            raise HTTPException(status_code=404, detail="Global model not found")
+        
+        # Load metadata
+        metadata_path = "models/global_metadata.json"
+        if not os.path.exists(metadata_path):
+            # Create default metadata if none exists
+            metadata = {
+                "version": f"manual_export_{int(time.time())}",
+                "timestamp": time.time(),
+                "round": current_round
+            }
+        else:
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+        
+        # Export the model
+        success = secure_transfer.export_global_model(model_path, metadata)
+        
+        if success:
+            return {"status": "success", "message": "Global model exported successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to export global model")
+    except Exception as e:
+        logger.error(f"Error exporting global model: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error exporting global model: {str(e)}")
+
 if __name__ == "__main__":
     # Create necessary directories
     os.makedirs("models", exist_ok=True)
     os.makedirs("updates", exist_ok=True)
     os.makedirs("models/versions", exist_ok=True)
     
+    # Start secure update check thread if in air-gapped mode
+    if AIR_GAPPED_MODE:
+        secure_check_thread = threading.Thread(target=check_secure_updates_periodically, daemon=True)
+        secure_check_thread.start()
+        logger.info("Started secure update check thread")
+    
     # Run the FastAPI application
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

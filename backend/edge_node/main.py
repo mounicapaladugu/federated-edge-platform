@@ -11,6 +11,7 @@ from training.trainer import ModelTrainer
 from fl_client import EdgeNodeFlowerClient
 import time
 import threading
+from common.fl.secure_transfer import SecureModelTransfer
 
 # Configure logging
 logging.basicConfig(
@@ -44,6 +45,11 @@ model_trainer = ModelTrainer(node_id=NODE_ID)
 # Initialize Flower client
 fl_client = EdgeNodeFlowerClient(node_id=NODE_ID, aggregator_url=AGGREGATOR_URL)
 
+# Initialize secure transfer
+SECURE_MOUNT_DIR = os.getenv("SECURE_MOUNT_DIR", "/mnt/secure_transfer")
+AIR_GAPPED_MODE = os.getenv("AIR_GAPPED_MODE", "false").lower() == "true"
+secure_transfer = SecureModelTransfer(node_id=NODE_ID, is_aggregator=False, mount_dir=SECURE_MOUNT_DIR)
+
 # Health monitoring variables
 health_metrics = {
     "status": "healthy",
@@ -72,17 +78,26 @@ health_thread.start()
 async def startup_event():
     """Register with the aggregator on startup"""
     logger.info(f"Edge Node {NODE_ID} starting up")
-    try:
-        response = requests.post(
-            f"{AGGREGATOR_URL}/register_node",
-            json={"node_id": NODE_ID, "api_url": f"http://edge-node-{NODE_ID}:8001"}
-        )
-        if response.status_code == 200:
-            logger.info(f"Successfully registered with aggregator")
-        else:
-            logger.error(f"Failed to register with aggregator: {response.text}")
-    except Exception as e:
-        logger.error(f"Error connecting to aggregator: {str(e)}")
+    
+    if not AIR_GAPPED_MODE:
+        try:
+            response = requests.post(
+                f"{AGGREGATOR_URL}/register_node",
+                json={"node_id": NODE_ID, "api_url": f"http://edge-node-{NODE_ID}:8001"}
+            )
+            if response.status_code == 200:
+                logger.info(f"Successfully registered with aggregator")
+            else:
+                logger.error(f"Failed to register with aggregator: {response.text}")
+        except Exception as e:
+            logger.error(f"Error connecting to aggregator: {str(e)}")
+    else:
+        logger.info(f"Running in air-gapped mode, skipping aggregator registration")
+        
+        # Start secure model check thread if in air-gapped mode
+        secure_check_thread = threading.Thread(target=check_for_new_models, daemon=True)
+        secure_check_thread.start()
+        logger.info("Started secure model check thread")
 
 @app.get("/")
 async def root():
@@ -133,6 +148,89 @@ async def update_privacy_settings(settings: dict):
         return {"status": "success", "settings": fl_client.privacy_setting}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating privacy settings: {str(e)}")
+
+def check_for_new_models():
+    """Background thread to periodically check for new models in air-gapped mode"""
+    while True:
+        try:
+            logger.info("Checking for new models in secure mount directory...")
+            if secure_transfer.check_for_new_model():
+                logger.info("New model found, importing...")
+                metadata = secure_transfer.import_global_model()
+                if metadata:
+                    logger.info(f"Successfully imported new model version: {metadata.get('version', 'unknown')}")
+                    
+                    # Schedule training
+                    model_path = os.path.join("models", f"model_node_{NODE_ID}.pt")
+                    if os.path.exists(model_path):
+                        from api.routes import train_model_task
+                        train_model_task()
+            else:
+                logger.info("No new models found")
+                
+            # Check if we need to export model updates
+            model_path = os.path.join("models", f"model_node_{NODE_ID}.pt")
+            if os.path.exists(model_path):
+                from api.routes import training_metrics
+                if training_metrics.get("training_complete", False):
+                    logger.info("Exporting model updates...")
+                    success = secure_transfer.export_model_update(model_path, training_metrics)
+                    if success:
+                        logger.info("Successfully exported model updates")
+                    
+        except Exception as e:
+            logger.error(f"Error in secure model check thread: {str(e)}")
+            
+        # Wait before checking again (e.g., every 5 minutes)
+        check_interval = int(os.getenv("SECURE_CHECK_INTERVAL", "300"))
+        time.sleep(check_interval)
+
+@app.get("/secure/check_models")
+async def manual_check_models(background_tasks: BackgroundTasks):
+    """Manually trigger a check for new models in the secure mount directory"""
+    background_tasks.add_task(manual_model_check)
+    return {"status": "checking", "message": "Checking for new models in secure mount directory"}
+
+def manual_model_check():
+    """Manual check for new models"""
+    try:
+        if secure_transfer.check_for_new_model():
+            logger.info("New model found, importing...")
+            metadata = secure_transfer.import_global_model()
+            if metadata:
+                logger.info(f"Successfully imported new model version: {metadata.get('version', 'unknown')}")
+                
+                # Schedule training
+                model_path = os.path.join("models", f"model_node_{NODE_ID}.pt")
+                if os.path.exists(model_path):
+                    from api.routes import train_model_task
+                    train_model_task()
+                return True
+        else:
+            logger.info("No new models found")
+            return False
+    except Exception as e:
+        logger.error(f"Error in manual model check: {str(e)}")
+        return False
+
+@app.post("/secure/export_update")
+async def manual_export_update():
+    """Manually trigger an export of model updates to the secure mount directory"""
+    try:
+        model_path = os.path.join("models", f"model_node_{NODE_ID}.pt")
+        if not os.path.exists(model_path):
+            raise HTTPException(status_code=404, detail="Model file not found")
+        
+        from api.routes import training_metrics
+        success = secure_transfer.export_model_update(model_path, training_metrics)
+        
+        if success:
+            return {"status": "success", "message": "Model update exported successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to export model update")
+    except Exception as e:
+        logger.error(f"Error exporting model update: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error exporting model update: {str(e)}")
 
 if __name__ == "__main__":
     # Run the FastAPI application
